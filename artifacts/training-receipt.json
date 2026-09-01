@@ -1,0 +1,63 @@
+{
+  "ambiguous_specialist": {
+    "categories": [
+      "Галантерея и аксессуары",
+      "Одежда",
+      "Ювелирные изделия"
+    ],
+    "corpus": {
+      "rows": 300000,
+      "rows_per_category": 100000,
+      "sha256": "1b528afe167ec8cfbff693457ebe8a23c50c5c0f73fcf1b5dce51cadf114eac9",
+      "target_mean": 0.22762341300163597
+    },
+    "initial_weights_sha256": "fe10ef5bc9c3d2e50284d5249909a813c962cc43963d0f33341b21b16995cc87",
+    "output_weights_sha256": "6ff790e7578f7796e467d42d8ef841cfa974860cf84832812e8d24f5db4d69a2",
+    "parameters": {
+      "batch_size": 256,
+      "epochs": 1,
+      "freeze_layers": 20,
+      "gradient_accumulation": 1,
+      "learning_rate": 1e-06,
+      "max_length": 384,
+      "minimum_rank_gap": 0.2,
+      "rank_weight": 0.5,
+      "seed": 2026083006,
+      "warmup_ratio": 0.05,
+      "weight_decay": 0.01
+    },
+    "seconds": 831.8057688102126,
+    "updates": 2346
+  },
+  "distillation": {
+    "base_logits_sha256": "d7f6757eaa5b4edf38f77b09d9951f4604d8887cd98852e6364fc7749474892e",
+    "base_probability_mean": 0.2114756962359051,
+    "full_kd50_corpus_sha256": "2d8af1b8c155f5b5b415f2a8e9f54fb0b2770df171a280ad650ea1b96080130e",
+    "llm_vote_weight": 0.5,
+    "matches_llm_only": true,
+    "private_selection_sha256": "22917fa489b373be02a079da4c6b1dded4b8e3b3596007fb0635812bcce95a2b",
+    "ranknet_probability_weight": 0.5,
+    "teacher_pairs_sha256": "7705930116f6d7f1bad2e04cd1d61938598bcaae25dda9940338277528c5fde3"
+  },
+  "route2_adaptation": {
+    "corpus": {
+      "official_llm_vote_rows": 9000,
+      "official_replay_rows": 100000,
+      "rows": 109000,
+      "sha256": "2df6e815bad25e29580b46209ebe4df2b8fe2c009d1e3fae746c69572fcfd1d2"
+    },
+    "output_weights_sha256": "fe10ef5bc9c3d2e50284d5249909a813c962cc43963d0f33341b21b16995cc87",
+    "parameters": {
+      "batch_size": 64,
+      "epochs": 3,
+      "freeze_layers": 12,
+      "gradient_accumulation": 2,
+      "learning_rate": 1e-06,
+      "max_length": 384,
+      "minimum_rank_gap": 0.2,
+      "rank_weight": 0.5,
+      "warmup_ratio": 0.05,
+      "weight_decay": 0.01
+    }
+  }
+}
