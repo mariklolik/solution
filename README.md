@@ -2,68 +2,105 @@
 
 ### Category-aware self-distillation для product matching
 
-> Официальный результат E-CUP 2026: `0.5259256928`, статус `Success`. В контейнере организатора 20 000 пар обработаны за 43.3 секунды без доступа к сети.
+Для каждой пары карточек нужно определить, описывают ли они один товар. В каталоге из 13,4 млн карточек одинаковое название означает разные вещи: среди таких пар доля совпадений меняется от 6.01% в аксессуарах до 95.69% в музыкальных инструментах. Анализ охватил 365 654 пар с ручной разметкой, 11 187 780 пар с LLM-разметкой, структуру атрибутов, числовые конфликты и граф совпадений.
 
-## Решение за четыре абзаца
+Решение направляет категории в три маршрута. Базовая модель обслуживает 15 категорий. Её адаптированная версия включается для `Мебели` и `Обуви`. Отдельная модель отвечает за аксессуары, одежду и ювелирные изделия; она обучена на 300 000 отобранных пар по методу KD50.
 
-Product matching в большом каталоге нельзя свести к одной шкале похожести. Одинаковое название музыкального инструмента почти всегда указывает на один товар, а в одежде за тем же названием могут скрываться другой размер, материал или модель. Ambiguous Route2 учитывает это прямо в архитектуре. Category router оставляет 15 стабильных категорий на исходном RankNet, отправляет `Мебель` и `Обувь` в Route2 checkpoint, а для `Галантереи и аксессуаров`, `Одежды` и `Ювелирных изделий` включает отдельный specialist. Каждый checkpoint меняет только свой участок каталога, поэтому domain adaptation остаётся локальной и управляемой.
+> Официальная оценка E-CUP 2026: macro PR-AUC `0.5259256928`, статус `Success`. Exact-container smoke: 20 000 пар за 43.3 секунды, без сети во время inference.
 
-Такой routing следует из структуры данных. Среди 13 397 761 карточки нашлось 1 806 552 полных текстовых дубля, однако крупнейшая группа из 6 002 карточек содержала общее название уровня «палатка 2-местная». Даже точное совпадение normalized title даёт радикально разную вероятность match: 6.01% в аксессуарах, 7.19% в обуви, 12.84% в одежде и 95.69% в музыкальных инструментах. Human graph тоже не помогает построить универсальное правило: 97.72% вершин имеют degree 1, triangles отсутствуют. Поэтому модель читает `Category`, `Name` и `Attributes` до общего лимита 3 600 символов, а решения принимает внутри категории.
+```mermaid
+flowchart TB
+    subgraph R["Исследование и обучение"]
+        A["EDA по 13.4 млн карточек"] --> B["3 категории, 5 strata, 300k пар"]
+        B --> C["KD50: LLM vote + ответ базовой модели"]
+        C --> D["Обученный specialist"]
+    end
 
-Ambiguous specialist обучен на 300 000 парах, поровну из трёх сложных категорий. Его soft target, KD50, смешивает два разных источника знания: `0.5 × official LLM vote + 0.5 × frozen RankNet probability`. RankNet probability усредняется для обоих порядков пары, чтобы target не зависел от того, какая карточка стоит слева. LLM даёт широкое покрытие каталога, frozen RankNet сохраняет уже выученную границу, а сбалансированная выборка не позволяет крупной категории задавить две остальные. Нижние 20 из 24 encoder layers заморожены; обучаются верхние слои и head. Objective объединяет soft BCE с pairwise RankNet loss в category-homogeneous batches.
+    subgraph I["Inference"]
+        E["Пара карточек"] --> F{"Маршрут по категории"}
+        F --> G["Base BGE / Route2 / KD50"]
+        G --> H["Ранг внутри категории + mMiniLM"]
+        H --> J["Итоговый score"]
+    end
 
-Inference повторяет ту же логику без лишней инфраструктуры. `run.py` потоково сканирует `items.parquet`, сохраняет только нужные карточки, сортирует пары по длине и запускает checkpoints последовательно, освобождая GPU-память между маршрутами. Для верхней половины score distribution внутри категории дополнительно считается обратный порядок пары. Затем logits переводятся во within-category percentile rank, после чего routed BGE rank смешивается с быстрым mMiniLM rank в пропорции `0.725 / 0.275`. Весь метод сводится к одному прозрачному forward path, который помещается в конкурсный runtime.
-
-```text
-Category + Name + Attributes
-              |
-              v
-       category router
-      /        |         \
- direct     Route2     KD50 specialist
- 15 cats    2 cats        3 cats
-      \        |         /
-       within-category rank
-              |
-    72.5% routed BGE rank
-      + 27.5% mMiniLM rank
-              |
-           predict
+    D -. "checkpoint" .-> G
 ```
 
-## Что именно показал EDA
+## Что EDA изменил в методе
 
-Пять срезов EDA свелись к трём решениям, которые видны в коде.
+EDA охватил содержимое карточек, связи между парами и качество supervision.
 
-Первое: exact text нельзя использовать как shortcut. Числа, размеры, OEM, fitment и совместимость часто лежат в длинном хвосте `Attributes`, поэтому [`structured_features.py`](structured_features.py) собирает карточку из всех трёх полей до truncation.
+| Проверка | Что нашли | Решение |
+|---|---|---|
+| Exact text | 1 806 552 полных текстовых дубля; крупнейшая группа содержит 6 002 карточки с общим названием | Не использовать exact title как shortcut; читать category и attributes |
+| Human graph | 97.72% вершин имеют degree 1, triangles отсутствуют | Не строить основной сигнал на graph propagation |
+| Numeric conflicts | 32 452 positive human-пары и 1 020 483 majority-positive LLM-пары содержат конфликтующие числа | Не вводить универсальный numeric veto |
+| LLM votes | Targets лежат на сетке `k/9`, prevalence зависит от категории | Не считать vote калиброванной вероятностью; использовать его как soft signal |
+| Attribute schemas | Карточки одной пары часто приходят из разных marketplace schemas | Сериализовать поля в один текст вместо позиционного сравнения ключей |
 
-Второе: teacher target нельзя читать как calibrated probability. В 11 187 780 LLM-парах значения лежат на сетке `k/9`, а 1 020 483 majority-positive пары содержат numeric conflicts. Эти конфликты особенно часты в personalization, optics, auto fitment и случаях «товар против аксессуара». Поэтому решение не использует один global threshold и не вводит жёсткий numeric veto.
+Для обучения specialist данные собираются по пяти strata: промежуточные LLM votes, exact-name conflicts, high-vote lexical mismatches, shared-prefix traps и остаточная выборка. Каждый тип ошибки гарантированно попадает в training corpus. Три категории получают по 100 000 строк, поэтому размер домена не определяет смесь данных.
 
-Третье: категория определяет смысл похожести сильнее, чем общий prior. Отсюда отдельный specialist, равные квоты по 100 000 пар и category routing вместо одного checkpoint на весь каталог. Полная сводка измерений находится в [`docs/EDA.md`](docs/EDA.md).
+Модель получает единую строку `Category + Name + Attributes`. Сериализация ограничена 3 600 символами, primary tokenizer оставляет до 384 tokens.
 
-## На каких работах стоит метод
+## Как статьи превратились в гипотезу
 
-- [jina-reranker-v3.5](https://arxiv.org/html/2607.18152v1) формулирует три близкие идеи: failure-mode-first curation, multi-domain mixture и self-distillation между моделями одного размера. В Ambiguous Route2 они проявляются как выбор сложных категорий по EDA, отдельный specialist и distillation без compression. Hybrid attention, LBNL и Jina weights здесь не используются.
-- [Learning without Forgetting](https://arxiv.org/abs/1606.09282) показывает, как сохранить ответы исходной модели при adaptation. Поэтому половина KD50 target приходит от замороженного RankNet, а большая часть encoder остаётся frozen.
-- [Born-Again Neural Networks](https://proceedings.mlr.press/v80/furlanello18a.html) рассматривает distillation без уменьшения student. Specialist сохраняет ту же BGE architecture: цель обучения состоит в переносе soft supervision, а не в сжатии.
-- [Learning to Rank using Gradient Descent](https://www.microsoft.com/en-us/research/publication/learning-to-rank-using-gradient-descent/) задаёт pairwise основу RankNet. В training loop она сохраняет относительный порядок пар внутри категории, пока soft BCE отвечает за сам score.
-- [Distilling Virtual Examples for Long-Tailed Recognition](https://openaccess.thecvf.com/content/ICCV2021/html/He_Distilling_Virtual_Examples_for_Long-Tailed_Recognition_ICCV_2021_paper.html) связывает distillation с распределением soft labels в long-tail данных. Практический вывод для этого решения прост: распределение supervision нужно контролировать, поэтому каждая ambiguous-категория получает одинаковую квоту.
+[jina-reranker-v3.5](https://arxiv.org/html/2607.18152v1) дал исследовательский шаблон: сначала найти конкретные failure modes general reranker, затем собрать targeted corpus под эти ошибки. В статье этот принцип применяется к legal, medical, financial и structured retrieval. Здесь он привёл к category-specific strata и отдельному specialist для трёх неоднозначных товарных доменов. Архитектуру Jina и её weights решение не использует.
 
-## Где смотреть код
+Вторая идея связана с сохранением уже выученной функции. [Learning without Forgetting](https://arxiv.org/abs/1606.09282) использует ответы старой модели как часть supervision при обучении на новых данных. [Born-Again Neural Networks](https://proceedings.mlr.press/v80/furlanello18a.html) показывает, что teacher и student могут иметь одинаковую ёмкость: distillation здесь передаёт поведение, а не сжимает модель. Поэтому KD50 student сохраняет 0.6B BGE architecture и учится одновременно у официального LLM signal и frozen Base BGE.
 
-| Файл | Что в нём |
+[RankNet](https://www.microsoft.com/en-us/research/publication/learning-to-rank-using-gradient-descent/) добавил pairwise часть objective. Она штрафует инверсии между примерами одной категории, если разница их KD targets не меньше `0.2`. [DiVE](https://openaccess.thecvf.com/content/ICCV2021/html/He_Distilling_Virtual_Examples_for_Long-Tailed_Recognition_ICCV_2021_paper.html) помог интерпретировать soft teacher outputs как распределение supervision, а не как обычные hard labels. Равные category quotas при этом следуют из нашего EDA, не из DiVE.
+
+Эти работы привели к проверяемой гипотезе: specialist получает новый signal на выбранных failure slices, а frozen scorer в KD target регулирует его отклонение от базовой модели.
+
+## KD50: что именно обучается
+
+Базовая модель, Base BGE, совместно читает две карточки и выдаёт logit совпадения. Для каждой training pair она вызывается в обоих направлениях: `(a, b)` и `(b, a)`. После sigmoid ответы усредняются.
+
+$$
+y_{KD50}=0.5\,y_{LLM}+0.5\,\frac{\sigma(z_{base}(a,b))+\sigma(z_{base}(b,a))}{2}
+$$
+
+`y_LLM` добавляет официальный soft-label signal на выбранных failure slices. Вторая половина target регуляризует specialist в сторону Base BGE. Поведение остальных 15 категорий сохраняет router: specialist там вообще не участвует в forward path.
+
+Student и teacher имеют одинаковую BGE architecture. У student заморожены embeddings и нижние 20 из 24 encoder layers. Soft BCE учит score по KD50 target. Pairwise term требует, чтобы пример с большим target получал больший logit; сравниваются только примеры одной категории. Один training run занимает 2 346 optimizer updates по сбалансированному корпусу из 300 000 строк.
+
+## Как выбиралась финальная конфигурация
+
+Первый adapted checkpoint обучался на six-category corpus. Покатегорийная проверка показала transfer разного знака, поэтому global deployment был отвергнут. В inference этот checkpoint разрешён только для `Мебели` и `Обуви`; отсюда Route2.
+
+Для specialist заранее зафиксировали ablations по доле distillation, initialization, глубине заморозки, learning rate и pairwise weight. Общий seven-category specialist не прошёл transfer gate; подробная сетка находится в [`docs/EXPERIMENTS.md`](docs/EXPERIMENTS.md).
+
+Финальный блок из аксессуаров, одежды и ювелирных изделий проверялся на двух независимых source-closed панелях. KD50 с Route2 initialization дал положительное изменение во всех трёх категориях на обеих панелях. Маршруты зафиксировали по результатам этих проверок до упаковки submission.
+
+## Что происходит на inference
+
+| Компонент | Роль |
 |---|---|
-| [`run.py`](run.py) | streaming I/O, model routing, reverse scoring и rank blend |
-| [`targeted_route.py`](targeted_route.py) | category masks и восстановление исходного порядка пар |
-| [`structured_features.py`](structured_features.py) | сериализация карточек и исследовательские pair features |
-| [`training/prepare_distillation.py`](training/prepare_distillation.py) | выбор пар, frozen-teacher scoring и сборка KD50 target |
-| [`training/train_specialist.py`](training/train_specialist.py) | frozen-depth continuation, soft BCE и pairwise loss |
-| [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | полный forward path и решения по runtime |
-| [`docs/EXPERIMENTS.md`](docs/EXPERIMENTS.md) | параметры обучения и подтверждённые результаты |
+| Base BGE | Основной 0.6B multilingual cross-encoder; совместно читает две карточки и обслуживает 15 категорий |
+| Route2 BGE | Checkpoint с six-category training lineage, включённый только для `Мебели` и `Обуви` после покатегорийной проверки |
+| KD50 specialist | Route2-initialized BGE для аксессуаров, одежды и ювелирных изделий; официальный LLM signal учит пограничным случаям, Base BGE регулирует отклонение |
+| mMiniLM | Независимо ранжирует те же пары и даёт второй score |
 
-## Запуск
+Перед смешиванием BGE и mMiniLM scores переводятся в процентиль внутри категории. Так несовместимые шкалы logits не усредняются напрямую. Итоговый score равен `0.725 × BGE rank + 0.275 × mMiniLM rank`.
 
-Веса лежат в [официально оценённом archive](https://storage.yandexcloud.net/ds-ods/files/submissions/0d0183cf-8864-4331-88be-f78da0c68dd2/c1a51c4b/submission-ambiguous-route2-v1.zip):
+## Почему решение укладывается в runtime
+
+`run.py` потоково сканирует `items.parquet` и сохраняет только карточки из входных пар. Пары сортируются по суммарной длине, чтобы сократить объём padding. BGE-модели загружаются последовательно и освобождаются после своего маршрута.
+
+Обратный порядок пары считается только для верхней половины распределения scores внутри категории. Дополнительный проход сосредоточен на парах, влияющих на верхнюю часть ranking. BGE-модели работают с `max_length=384` и batch size 384; mMiniLM использует `max_length=256` и batch size 1024.
+
+## Код и запуск
+
+| Файл | Ответственность |
+|---|---|
+| [`run.py`](run.py) | streaming I/O, routing, reverse scoring, rank blend |
+| [`targeted_route.py`](targeted_route.py) | category masks и восстановление порядка пар |
+| [`structured_features.py`](structured_features.py) | сериализация карточек |
+| [`training/prepare_distillation.py`](training/prepare_distillation.py) | failure-targeted sampling, Base BGE scoring, KD50 |
+| [`training/train_specialist.py`](training/train_specialist.py) | frozen-depth training, soft BCE, pairwise loss |
+| [`docs/EDA.md`](docs/EDA.md) | полный EDA и связь измерений с дизайном |
+
+Веса находятся в [архиве решения, прошедшего официальную оценку](https://storage.yandexcloud.net/ds-ods/files/submissions/0d0183cf-8864-4331-88be-f78da0c68dd2/c1a51c4b/submission-ambiguous-route2-v1.zip):
 
 ```bash
 curl -L https://storage.yandexcloud.net/ds-ods/files/submissions/0d0183cf-8864-4331-88be-f78da0c68dd2/c1a51c4b/submission-ambiguous-route2-v1.zip -o /tmp/ambiguous-route2.zip
@@ -74,11 +111,4 @@ python -u run.py \
   --output_path submission.csv
 ```
 
-Сборка submission и тесты:
-
-```bash
-python -m scripts.package_submission --output outputs/submission-ambiguous-route2.zip
-PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python -m pytest -q
-```
-
-Contest data в репозиторий не входит. Подготовка данных, обучение и упаковка описаны в [`docs/REPRODUCIBILITY.md`](docs/REPRODUCIBILITY.md).
+Подготовка данных, обучение и упаковка описаны в [`docs/REPRODUCIBILITY.md`](docs/REPRODUCIBILITY.md). Данные соревнования в репозиторий не входят.
